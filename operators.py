@@ -2,15 +2,16 @@ import bpy
 import bmesh
 import mathutils
 import numpy as np
+import cv2
 from bpy.types import Operator
 from bpy.props import StringProperty
 import os
 
-from .utils.landmarks import FacialLandmarkDetector
-from .utils.warping import ImageWarper
-from .utils.ai_inpainting import AIInpainter
-from .utils.uv_analysis import UVAnalyzer
-from .utils.image_utils import ImageProcessor
+from .landmarks import FacialLandmarkDetector
+from .warping import ImageWarper
+from .inpainting import AIInpainter
+from .uv_analysis import UVAnalyzer
+from .image_utils import ImageProcessor
 
 class FACETEX_OT_load_image(Operator):
     """Load reference image"""
@@ -22,18 +23,42 @@ class FACETEX_OT_load_image(Operator):
     
     def execute(self, context):
         scene = context.scene
+        
+        # Validate file path
+        if not self.filepath:
+            self.report({'ERROR'}, "No file path provided")
+            return {'CANCELLED'}
+        
+        # Check if file exists
+        abs_filepath = bpy.path.abspath(self.filepath)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"File not found: {self.filepath}")
+            return {'CANCELLED'}
+        
+        # Check file extension
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tga'}
+        file_ext = os.path.splitext(self.filepath)[1].lower()
+        if file_ext not in valid_extensions:
+            self.report({'ERROR'}, f"Unsupported image format: {file_ext}. Supported: {', '.join(valid_extensions)}")
+            return {'CANCELLED'}
+        
         scene.face_texture.reference_image = self.filepath
         
-        # Initialize image processor
-        self.image_processor = ImageProcessor()
-        success = self.image_processor.load_image(self.filepath)
-        
-        if success:
-            self.report({'INFO'}, f"Loaded image: {os.path.basename(self.filepath)}")
-        else:
-            self.report({'ERROR'}, "Failed to load image")
+        # Initialize image processor with error handling
+        try:
+            self.image_processor = ImageProcessor()
+            success = self.image_processor.load_image(abs_filepath)
             
-        return {'FINISHED'}
+            if success:
+                self.report({'INFO'}, f"Loaded image: {os.path.basename(self.filepath)}")
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Failed to load image - invalid or corrupted file")
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            self.report({'ERROR'}, f"Error loading image: {str(e)}")
+            return {'CANCELLED'}
     
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -49,38 +74,91 @@ class FACETEX_OT_detect_landmarks(Operator):
         scene = context.scene
         props = scene.face_texture
         
+        # Validate input
         if not props.reference_image:
             self.report({'ERROR'}, "No reference image loaded")
             return {'CANCELLED'}
         
-        # Initialize landmark detector
-        detector = FacialLandmarkDetector()
-        landmarks = detector.detect(props.reference_image, props.landmark_confidence)
-        
-        if landmarks is None:
-            self.report({'ERROR'}, "No face detected in image")
+        # Check if image file exists
+        abs_filepath = bpy.path.abspath(props.reference_image)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"Reference image file not found: {props.reference_image}")
             return {'CANCELLED'}
         
-        # Create empty objects for landmarks
-        self.create_landmark_empties(landmarks)
-        
-        self.report({'INFO'}, f"Detected {len(landmarks)} facial landmarks")
-        return {'FINISHED'}
+        try:
+            # Initialize landmark detector
+            detector = FacialLandmarkDetector()
+            
+            # Check if detector is available
+            if not hasattr(detector, 'available') or not detector.available:
+                self.report({'WARNING'}, "MediaPipe not available, using fallback detection")
+            
+            landmarks = detector.detect(abs_filepath, props.landmark_confidence)
+            
+            if landmarks is None or len(landmarks) == 0:
+                self.report({'ERROR'}, "No face detected in image. Try adjusting the detection confidence or use a clearer image.")
+                return {'CANCELLED'}
+            
+            # Get image dimensions
+            try:
+                import cv2
+                image = cv2.imread(abs_filepath)
+                if image is not None:
+                    image_height, image_width = image.shape[:2]
+                    # Validate image dimensions
+                    if image_width < 64 or image_height < 64:
+                        self.report({'ERROR'}, f"Image too small ({image_width}x{image_height}). Minimum size is 64x64 pixels.")
+                        return {'CANCELLED'}
+                    if image_width > 8192 or image_height > 8192:
+                        self.report({'WARNING'}, f"Large image ({image_width}x{image_height}). Processing may be slow.")
+                else:
+                    # Fallback dimensions
+                    image_width, image_height = 1024, 1024
+                    self.report({'WARNING'}, "Could not read image dimensions, using defaults")
+            except Exception as e:
+                # Fallback dimensions
+                image_width, image_height = 1024, 1024
+                self.report({'WARNING'}, f"Could not read image dimensions: {e}")
+            
+            # Create empty objects for landmarks
+            self.create_landmark_empties(landmarks, image_width, image_height)
+            
+            self.report({'INFO'}, f"Detected {len(landmarks)} facial landmarks")
+            return {'FINISHED'}
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Error during landmark detection: {str(e)}")
+            return {'CANCELLED'}
     
-    def create_landmark_empties(self, landmarks):
+    def create_landmark_empties(self, landmarks, image_width=1024, image_height=1024):
         """Create empty objects for each landmark"""
         # Clear existing landmarks
         for obj in bpy.data.objects:
             if obj.name.startswith("Landmark_"):
                 bpy.data.objects.remove(obj)
         
-        # Create new landmarks
+        # Store image dimensions as custom properties for later reference
+        scene = bpy.context.scene
+        scene["landmark_image_width"] = image_width
+        scene["landmark_image_height"] = image_height
+        
+        # Create new landmarks with proper scaling
+        # Scale down pixel coordinates to reasonable Blender units (0.01 units per pixel)
+        scale_factor = 0.01
         for i, (x, y) in enumerate(landmarks):
-            bpy.ops.object.empty_add(type='SPHERE', location=(x/100, y/100, 0))
+            # Convert from image coordinates to Blender world coordinates
+            world_x = (x - image_width/2) * scale_factor
+            world_y = (image_height/2 - y) * scale_factor  # Flip Y axis for Blender
+            
+            bpy.ops.object.empty_add(type='SPHERE', location=(world_x, world_y, 0))
             empty = bpy.context.active_object
             empty.name = f"Landmark_{i:03d}"
             empty.show_name = True
             empty.empty_display_size = 0.02
+            
+            # Store original pixel coordinates as custom properties
+            empty["pixel_x"] = x
+            empty["pixel_y"] = y
 
 class FACETEX_OT_generate_texture(Operator):
     """Generate texture using AI and warping"""
@@ -92,13 +170,29 @@ class FACETEX_OT_generate_texture(Operator):
         scene = context.scene
         props = scene.face_texture
         
-        # Validation
+        # Enhanced validation
         if not props.reference_image:
             self.report({'ERROR'}, "No reference image loaded")
             return {'CANCELLED'}
             
+        # Check if reference image exists
+        abs_filepath = bpy.path.abspath(props.reference_image)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"Reference image file not found: {props.reference_image}")
+            return {'CANCELLED'}
+            
         if not props.target_object:
             self.report({'ERROR'}, "No target object selected")
+            return {'CANCELLED'}
+        
+        # Validate target object
+        if props.target_object.type != 'MESH':
+            self.report({'ERROR'}, "Selected target object is not a mesh")
+            return {'CANCELLED'}
+        
+        # Check if target object has UV mapping
+        if not props.target_object.data.uv_layers:
+            self.report({'ERROR'}, "Target object has no UV mapping. Add UV coordinates first.")
             return {'CANCELLED'}
         
         # Get landmarks from empty objects
@@ -167,8 +261,21 @@ class FACETEX_OT_generate_texture(Operator):
         landmark_objects.sort(key=lambda x: x.name)
         
         for obj in landmark_objects:
-            loc = obj.location
-            landmarks.append((loc.x * 100, loc.y * 100))  # Scale back
+            # Use stored pixel coordinates if available
+            if "pixel_x" in obj and "pixel_y" in obj:
+                landmarks.append((obj["pixel_x"], obj["pixel_y"]))
+            else:
+                # Fallback: convert world coordinates back to pixel coordinates
+                scene = bpy.context.scene
+                image_width = scene.get("landmark_image_width", 1024)
+                image_height = scene.get("landmark_image_height", 1024)
+                scale_factor = 0.01
+                
+                # Convert from world coordinates back to pixel coordinates
+                loc = obj.location
+                pixel_x = loc.x / scale_factor + image_width/2
+                pixel_y = image_height/2 - loc.y / scale_factor
+                landmarks.append((pixel_x, pixel_y))
         
         return landmarks
     
@@ -176,9 +283,34 @@ class FACETEX_OT_generate_texture(Operator):
         """Save generated textures to disk"""
         if not props.output_path:
             return
+            
+        # Validate input image
+        if not isinstance(image, np.ndarray):
+            self.report({'ERROR'}, "Invalid image data: expected numpy array")
+            return
+            
+        if len(image.shape) < 2:
+            self.report({'ERROR'}, "Invalid image dimensions")
+            return
         
         output_path = bpy.path.abspath(props.output_path)
         os.makedirs(output_path, exist_ok=True)
+        
+        # Validate and normalize image format
+        if len(image.shape) == 2:
+            # Grayscale image - convert to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif len(image.shape) == 3 and image.shape[2] == 4:
+            # RGBA image - convert to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        elif len(image.shape) == 3 and image.shape[2] != 3:
+            self.report({'ERROR'}, f"Unsupported image format: {image.shape[2]} channels")
+            return
+        
+        # Ensure image values are in valid range
+        if image.dtype != np.uint8:
+            # Normalize to 0-255 range
+            image = np.clip(image, 0, 255).astype(np.uint8)
         
         # Save main texture
         filename = f"face_texture.{props.export_format.lower()}"
@@ -186,21 +318,30 @@ class FACETEX_OT_generate_texture(Operator):
         
         # Convert numpy array to Blender image
         height, width = image.shape[:2]
-        blender_image = bpy.data.images.new("FaceTexture", width, height)
         
-        # Flatten and normalize image data
-        pixels = image.flatten() / 255.0
-        if len(pixels) == width * height * 3:  # RGB
-            # Add alpha channel
-            rgba_pixels = []
-            for i in range(0, len(pixels), 3):
-                rgba_pixels.extend([pixels[i], pixels[i+1], pixels[i+2], 1.0])
-            pixels = rgba_pixels
-        
-        blender_image.pixels = pixels
-        blender_image.filepath_raw = filepath
-        blender_image.file_format = props.export_format
-        blender_image.save()
+        try:
+            blender_image = bpy.data.images.new("FaceTexture", width, height)
+            
+            # Flatten and normalize image data for Blender
+            # Blender expects RGBA values in 0.0-1.0 range
+            pixels = image.astype(np.float32) / 255.0
+            
+            # Ensure we have RGB data and add alpha channel
+            if len(pixels.shape) == 3 and pixels.shape[2] == 3:
+                # Add alpha channel (fully opaque)
+                rgba_pixels = np.ones((height, width, 4), dtype=np.float32)
+                rgba_pixels[:, :, :3] = pixels
+                pixels = rgba_pixels
+            
+            # Blender expects flattened RGBA data
+            blender_image.pixels = pixels.flatten()
+            blender_image.filepath_raw = filepath
+            blender_image.file_format = props.export_format
+            blender_image.save()
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to save texture: {str(e)}")
+            return
     
     def apply_to_material(self, target_obj, texture_image):
         """Apply generated texture to object material"""

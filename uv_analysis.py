@@ -265,4 +265,7 @@ class UVAnalyzer:
             y = sum(p[1] for p in points) / len(points)
             return (x, y)
         else:  # 3D points
-            x = sum(p[0] for
+            x = sum(p[0] for p in points) / len(points)
+            y = sum(p[1] for p in points) / len(points)
+            z = sum(p[2] for p in points) / len(points)
+            return (x, y, z)
