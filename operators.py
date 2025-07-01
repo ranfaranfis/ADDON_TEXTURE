@@ -23,18 +23,42 @@ class FACETEX_OT_load_image(Operator):
     
     def execute(self, context):
         scene = context.scene
+        
+        # Validate file path
+        if not self.filepath:
+            self.report({'ERROR'}, "No file path provided")
+            return {'CANCELLED'}
+        
+        # Check if file exists
+        abs_filepath = bpy.path.abspath(self.filepath)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"File not found: {self.filepath}")
+            return {'CANCELLED'}
+        
+        # Check file extension
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tga'}
+        file_ext = os.path.splitext(self.filepath)[1].lower()
+        if file_ext not in valid_extensions:
+            self.report({'ERROR'}, f"Unsupported image format: {file_ext}. Supported: {', '.join(valid_extensions)}")
+            return {'CANCELLED'}
+        
         scene.face_texture.reference_image = self.filepath
         
-        # Initialize image processor
-        self.image_processor = ImageProcessor()
-        success = self.image_processor.load_image(self.filepath)
-        
-        if success:
-            self.report({'INFO'}, f"Loaded image: {os.path.basename(self.filepath)}")
-        else:
-            self.report({'ERROR'}, "Failed to load image")
+        # Initialize image processor with error handling
+        try:
+            self.image_processor = ImageProcessor()
+            success = self.image_processor.load_image(abs_filepath)
             
-        return {'FINISHED'}
+            if success:
+                self.report({'INFO'}, f"Loaded image: {os.path.basename(self.filepath)}")
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Failed to load image - invalid or corrupted file")
+                return {'CANCELLED'}
+                
+        except Exception as e:
+            self.report({'ERROR'}, f"Error loading image: {str(e)}")
+            return {'CANCELLED'}
     
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -50,36 +74,61 @@ class FACETEX_OT_detect_landmarks(Operator):
         scene = context.scene
         props = scene.face_texture
         
+        # Validate input
         if not props.reference_image:
             self.report({'ERROR'}, "No reference image loaded")
             return {'CANCELLED'}
         
-        # Initialize landmark detector
-        detector = FacialLandmarkDetector()
-        landmarks = detector.detect(props.reference_image, props.landmark_confidence)
-        
-        if landmarks is None:
-            self.report({'ERROR'}, "No face detected in image")
+        # Check if image file exists
+        abs_filepath = bpy.path.abspath(props.reference_image)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"Reference image file not found: {props.reference_image}")
             return {'CANCELLED'}
         
-        # Get image dimensions
         try:
-            import cv2
-            image = cv2.imread(bpy.path.abspath(props.reference_image))
-            if image is not None:
-                image_height, image_width = image.shape[:2]
-            else:
+            # Initialize landmark detector
+            detector = FacialLandmarkDetector()
+            
+            # Check if detector is available
+            if not hasattr(detector, 'available') or not detector.available:
+                self.report({'WARNING'}, "MediaPipe not available, using fallback detection")
+            
+            landmarks = detector.detect(abs_filepath, props.landmark_confidence)
+            
+            if landmarks is None or len(landmarks) == 0:
+                self.report({'ERROR'}, "No face detected in image. Try adjusting the detection confidence or use a clearer image.")
+                return {'CANCELLED'}
+            
+            # Get image dimensions
+            try:
+                import cv2
+                image = cv2.imread(abs_filepath)
+                if image is not None:
+                    image_height, image_width = image.shape[:2]
+                    # Validate image dimensions
+                    if image_width < 64 or image_height < 64:
+                        self.report({'ERROR'}, f"Image too small ({image_width}x{image_height}). Minimum size is 64x64 pixels.")
+                        return {'CANCELLED'}
+                    if image_width > 8192 or image_height > 8192:
+                        self.report({'WARNING'}, f"Large image ({image_width}x{image_height}). Processing may be slow.")
+                else:
+                    # Fallback dimensions
+                    image_width, image_height = 1024, 1024
+                    self.report({'WARNING'}, "Could not read image dimensions, using defaults")
+            except Exception as e:
                 # Fallback dimensions
                 image_width, image_height = 1024, 1024
-        except:
-            # Fallback dimensions
-            image_width, image_height = 1024, 1024
-        
-        # Create empty objects for landmarks
-        self.create_landmark_empties(landmarks, image_width, image_height)
-        
-        self.report({'INFO'}, f"Detected {len(landmarks)} facial landmarks")
-        return {'FINISHED'}
+                self.report({'WARNING'}, f"Could not read image dimensions: {e}")
+            
+            # Create empty objects for landmarks
+            self.create_landmark_empties(landmarks, image_width, image_height)
+            
+            self.report({'INFO'}, f"Detected {len(landmarks)} facial landmarks")
+            return {'FINISHED'}
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Error during landmark detection: {str(e)}")
+            return {'CANCELLED'}
     
     def create_landmark_empties(self, landmarks, image_width=1024, image_height=1024):
         """Create empty objects for each landmark"""
@@ -121,13 +170,29 @@ class FACETEX_OT_generate_texture(Operator):
         scene = context.scene
         props = scene.face_texture
         
-        # Validation
+        # Enhanced validation
         if not props.reference_image:
             self.report({'ERROR'}, "No reference image loaded")
             return {'CANCELLED'}
             
+        # Check if reference image exists
+        abs_filepath = bpy.path.abspath(props.reference_image)
+        if not os.path.exists(abs_filepath):
+            self.report({'ERROR'}, f"Reference image file not found: {props.reference_image}")
+            return {'CANCELLED'}
+            
         if not props.target_object:
             self.report({'ERROR'}, "No target object selected")
+            return {'CANCELLED'}
+        
+        # Validate target object
+        if props.target_object.type != 'MESH':
+            self.report({'ERROR'}, "Selected target object is not a mesh")
+            return {'CANCELLED'}
+        
+        # Check if target object has UV mapping
+        if not props.target_object.data.uv_layers:
+            self.report({'ERROR'}, "Target object has no UV mapping. Add UV coordinates first.")
             return {'CANCELLED'}
         
         # Get landmarks from empty objects
